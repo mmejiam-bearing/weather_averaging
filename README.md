@@ -13,14 +13,19 @@ maritime routing heuristics.**
 # 1. Initialize submodules (cnpy, GoogleTest)
 git submodule update --init --recursive
 
-# 2. Configure and build  (macOS: see Section 7 for the AppleClang+libomp variant)
+# 2. Configure and build
+#    Linux:  -j$(nproc)
+#    macOS:  -j$(sysctl -n hw.ncpu)   (see Section 7 for the full AppleClang variant)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
 # 3. Run the daily averager
+#    --data-dir:   root of the <YYYY>/<MM>/<DD>/<HH>/ input tree
+#    --output-dir: daily-averaged .npy files written here
+#    --threads:    parallelism (default: all logical cores)
 ./build/weather_daily_avg \
-  --data-dir   /path/to/data \   # root of the <YYYY>/<MM>/<DD>/<HH>/ input tree
-  --output-dir /path/to/output \ # daily averaged .npy files written here
+  --data-dir   /path/to/data \
+  --output-dir /path/to/output \
   --years      2024 \
   --months     1 2 3 \
   --threads    8
@@ -144,7 +149,7 @@ This nonlinearity has a direct consequence for temporal averaging: **arithmetic 
 underestimates the physical impact** of a distribution that contains episodic high-intensity
 events. A sea state that is 0 m for 6 hours and 4 m for 6 hours is not equivalent to a constant
 2 m sea state; the 4 m period contributes 16× more resistance than the 2 m period per unit time,
-so the representative height for resistance purposes is `sqrt(0² + 4²)/2 ≈ 2.83 m`, not 2 m.
+so the representative height for resistance purposes is `sqrt((0² + 4²)/2) ≈ 2.83 m`, not 2 m.
 
 The pipeline in this repository therefore applies **energy-based averaging** throughout, ensuring
 that the daily summary fields fed to the routing heuristic correctly reflect the
@@ -303,7 +308,7 @@ from up to 8 hourly input snapshots:
 | `was.npy`         | `U_eff`         | Drag-equivalent was                | m/s     | wind grid (721,1440) |
 | `wad.npy`         | `θ_eff,wind`    | Energy-weighted wad, weight=was²  | degrees | wind grid (721,1440) |
 | `pwd.npy`         | `θ_eff,peak`    | Energy-weighted pwd, weight=pwh²  | degrees | wave grid (621,1440) |
-| `swell_residual`  | `H_swell`       | Derived from sigwh/wsh             | m       | wave grid (621,1440) |
+| `swell_residual.npy` | `H_swell`    | Derived from sigwh/wsh             | m       | wave grid (621,1440) |
 
 `pwh` is loaded only to weight `pwd`'s energy-weighted circular mean — it is not itself an
 output field (see Section 4.7).
@@ -410,7 +415,9 @@ for (int t = 0; t < N; ++t) {
     double h = H_stack[t](i, j);
     if (!std::isnan(h)) { sum_sq += h * h; ++count; }
 }
-double H_eff = (count > 0) ? std::sqrt(sum_sq / count) : std::nan("");
+result(i, j) = (count >= min_valid_hours)
+                   ? std::sqrt(sum_sq / static_cast<double>(count))
+                   : std::numeric_limits<double>::quiet_NaN();
 ```
 
 ### 4.3 Energy-Weighted Period
@@ -449,15 +456,19 @@ physically meaningless when there are no waves.
 
 ```cpp
 double sum_sq = 0.0, sum_Tw = 0.0;
+int count = 0;
 for (int t = 0; t < N; ++t) {
     double h = H_stack[t](i, j);
     if (std::isnan(h)) continue;
     double w = h * h;
     sum_sq += w;
+    ++count;
     double T = T_stack[t](i, j);
     if (!std::isnan(T)) sum_Tw += w * T;
 }
-double T_eff = (sum_sq > 0.0) ? sum_Tw / sum_sq : std::nan("");
+result(i, j) = (count >= min_valid_hours && sum_sq > 0.0)
+                   ? sum_Tw / sum_sq
+                   : std::numeric_limits<double>::quiet_NaN();
 ```
 
 ### 4.4 Energy-Weighted Direction: Circular Statistics
@@ -515,18 +526,22 @@ consistent with physical intuition (a calm period has no meaningful wave directi
 
 ```cpp
 double sum_u = 0.0, sum_v = 0.0;
+int count = 0;
 for (int t = 0; t < N; ++t) {
     double h = H_stack[t](i, j);
     double theta = dir_stack[t](i, j);
     if (std::isnan(h) || std::isnan(theta)) continue;
     double w = h * h;
-    double rad = theta * M_PI / 180.0;
+    double rad = theta * PI / 180.0;
     sum_u += w * std::sin(rad);
     sum_v += w * std::cos(rad);
+    ++count;
 }
-double theta_eff = std::fmod(
-    std::atan2(sum_u, sum_v) * 180.0 / M_PI + 360.0, 360.0
-);
+// atan2 argument order is (sin, cos) per the meteorological clockwise-from-North
+// convention -- do not swap to (y, x).
+double theta_eff = (count >= min_valid_hours)
+    ? std::fmod(std::atan2(sum_u, sum_v) * 180.0 / PI + 360.0, 360.0)
+    : std::numeric_limits<double>::quiet_NaN();
 ```
 
 The `+ 360.0` before `fmod` ensures the result is in `[0°, 360°)` even when `atan2` returns a
@@ -641,15 +656,25 @@ as NaN in all input `.npy` files, **not as zero**. This distinction is critical:
 - A NaN cell should propagate NaN in output (land remains land).
 - A zero cell represents a calm sea (valid observation of zero wave height or wind speed).
 
-Averaging functions in this pipeline use `std::isnan` guards on every accumulation. A cell is
-output as NaN if and only if all input timesteps for that cell are NaN. A cell with at least one
-valid non-NaN timestep is averaged over valid timesteps only; the averaging denominator
-(`N_valid` or `Σ H²`) reflects only valid inputs.
+Averaging functions in this pipeline use `std::isnan` guards on every accumulation. The
+`--min-valid-hours` threshold (default 2, set in `config::DEFAULT_MIN_VALID_HOURS`) is applied
+at two distinct levels:
 
-Days with fewer than 2 valid hourly timesteps at a cell are treated as data-insufficient and
-output NaN for that cell, regardless of the value of the valid timesteps. This threshold
-(configurable via `--min-valid-hours`) prevents single-point outliers from being treated as a
-representative daily average.
+1. **Day level** (`process_day`): if fewer than `min_valid_hours` complete hourly snapshot
+   directories are found on disk for a given day, the entire day is skipped — no output files
+   are written, and a warning is printed to `stderr`.
+2. **Cell level** (averaging functions): within a day that *does* produce output, each grid cell
+   accumulates only its non-NaN hourly values. A cell outputs NaN if the count of its valid
+   (non-NaN) timesteps falls below `min_valid_hours`, regardless of which hours those are.
+
+This means a cell can output NaN even on a day where most cells have 8 valid readings (e.g., a
+transient ice-edge cell covered by sea ice in all but one snapshot). A cell is only guaranteed a
+non-NaN output when it has at least `min_valid_hours` valid (non-NaN) values across the day's
+hourly snapshots.
+
+The threshold prevents single-reading outliers from masquerading as a representative daily
+average. The denominator in every averaging formula (`N_valid` or `Σ H²`) reflects only the
+valid inputs, never the total possible snapshot count.
 
 **Caveat for `int8`-coded direction fields (`wsd`, `wad`):** `int8` has no NaN representation, so
 these fields carry no land mask of their own — observed land/no-data cells in the real archive
@@ -876,7 +901,9 @@ Notes:
 - Color scale per field is fixed across all frames in that field's GIF (data-driven min/max,
   except the direction fields' fixed 0–360 range) so day-to-day comparisons are visually
   meaningful.
-- Pass `--fields sigwh wsd` to render a subset, or `--fps` to change animation speed.
+- Pass `--fields sigwh wsd` to render a subset, `--fps` to change animation speed, `--step 7`
+  to subsample weekly (as used for the GIFs embedded in this README), or `--dpi`/`--figsize`
+  to control output resolution.
 
 ---
 
