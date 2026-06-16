@@ -3,6 +3,72 @@
 **Physically rigorous daily energy-averaging of GFS-Wave / WAVEWATCH III gridded fields for
 maritime routing heuristics.**
 
+---
+
+## Quick Start
+
+### Build and run
+
+```bash
+# 1. Initialize submodules (cnpy, GoogleTest)
+git submodule update --init --recursive
+
+# 2. Configure and build  (macOS: see Section 7 for the AppleClang+libomp variant)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+
+# 3. Run the daily averager
+./build/weather_daily_avg \
+  --data-dir   /path/to/data \   # root of the <YYYY>/<MM>/<DD>/<HH>/ input tree
+  --output-dir /path/to/output \ # daily averaged .npy files written here
+  --years      2024 \
+  --months     1 2 3 \
+  --threads    8
+```
+
+Outputs 8 `.npy` files per calendar day under `<output-dir>/<YYYY>/<MM>/<DD>/`:
+`sigwh`, `wsh`, `wsp`, `wsd`, `was`, `wad`, `pwd`, `swell_residual`.
+
+### Performance
+
+Measured on the 2024 full-year production run (366 days, external USB HDD).
+The workload is **I/O-bound** on spinning disk — thread scaling plateaus early:
+
+| Threads | Wall-clock per day | Full year (366 days) |
+|---------|--------------------|----------------------|
+| 1       | ~4.0 s             | ~24 min              |
+| 4       | ~2.8 s             | ~17 min              |
+| 8       | ~2.6 s             | ~16 min              |
+
+On NVMe/SSD storage the per-day time and thread scaling will be significantly better.
+Pass `--threads N` to control parallelism (default: all available logical cores).
+
+### Output previews
+
+Animated weekly snapshots (53 frames, Jan–Dec 2024) for all 8 output fields:
+
+**Wave grid (621×1440, lat ∈ [−75°, 80°])**
+
+| Significant wave height (`sigwh`) | Wind-sea height (`wsh`) |
+|---|---|
+| ![sigwh](gifs/sigwh.gif) | ![wsh](gifs/wsh.gif) |
+
+| Wind-sea period (`wsp`) | Wind-sea direction (`wsd`) |
+|---|---|
+| ![wsp](gifs/wsp.gif) | ![wsd](gifs/wsd.gif) |
+
+| Peak-wave direction (`pwd`) | Swell residual (`swell_residual`) |
+|---|---|
+| ![pwd](gifs/pwd.gif) | ![swell_residual](gifs/swell_residual.gif) |
+
+**Wind grid (721×1440, lat ∈ [−90°, 90°])**
+
+| Wind speed (`was`) | Wind direction (`wad`) |
+|---|---|
+| ![was](gifs/was.gif) | ![wad](gifs/wad.gif) |
+
+---
+
 **Related documents:**
 - [`summary.md`](summary.md) — concise conceptual explainer of the algorithm (grids, the row-0
   = south convention, and the per-day averaging math), without the operational/build detail
