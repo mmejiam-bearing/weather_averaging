@@ -33,9 +33,6 @@ data/weather/
 *.geojson
 *.csv
 
-# Agent files
-AGENTS.md
-SUMMARY.md
 
 # Mount / sandbox data
 mnt/
